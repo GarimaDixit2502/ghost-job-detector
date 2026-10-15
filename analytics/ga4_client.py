@@ -24,12 +24,89 @@ PILOT_BENCHMARK_METRICS: List[Dict[str, Any]] = [
 ]
 
 
+def _get_config_value(key: str) -> Optional[str]:
+    """Retrieve config value from env vars or Streamlit secrets."""
+    val = os.getenv(key)
+    if val and "your_" not in val.lower():
+        return val
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets") and key in st.secrets:
+            s_val = str(st.secrets[key])
+            if s_val and "your_" not in s_val.lower():
+                return s_val
+    except Exception:
+        pass
+    return None
+
+
+_TELEMETRY_EVENT_BUFFER: List[Dict[str, Any]] = []
+
+
+def get_ga4_measurement_id() -> Optional[str]:
+    """Retrieve verified active GA4 Measurement ID."""
+    mid = _get_config_value("GA4_MEASUREMENT_ID")
+    if mid and "your_" not in mid.lower():
+        return mid
+    return None
+
+
+def send_ga4_measurement_event(
+    event_name: str,
+    params: Optional[Dict[str, Any]] = None,
+    client_id: str = "ghost-app-client-1",
+) -> bool:
+    """Send a custom event to GA4 via Measurement Protocol if API secret is available,
+    and register the event in the local telemetry buffer for live dashboard inspection.
+    """
+    global _TELEMETRY_EVENT_BUFFER
+    if params is None:
+        params = {}
+
+    measurement_id = get_ga4_measurement_id()
+    api_secret = _get_config_value("GA4_API_SECRET")
+
+    event_record = {
+        "event_name": event_name,
+        "params": params,
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "measurement_id": measurement_id or "Not Configured",
+        "dispatched": False,
+    }
+
+    if measurement_id and api_secret and "your_" not in api_secret.lower():
+        try:
+            import requests
+
+            url = f"https://www.google-analytics.com/mp/collect?measurement_id={measurement_id}&api_secret={api_secret}"
+            payload = {
+                "client_id": client_id,
+                "events": [{"name": event_name, "params": params}],
+            }
+            resp = requests.post(url, json=payload, timeout=4)
+            if resp.status_code in [200, 204]:
+                event_record["dispatched"] = True
+                logger.info(f"Dispatched GA4 event '{event_name}' via Measurement Protocol.")
+            else:
+                logger.warning(f"GA4 Measurement Protocol returned HTTP {resp.status_code}")
+        except Exception as e:
+            logger.debug(f"Could not dispatch GA4 event '{event_name}': {e}")
+
+    _TELEMETRY_EVENT_BUFFER.insert(0, event_record)
+    if len(_TELEMETRY_EVENT_BUFFER) > 50:
+        _TELEMETRY_EVENT_BUFFER = _TELEMETRY_EVENT_BUFFER[:50]
+
+    return True
+
+
+def get_recent_telemetry_events() -> List[Dict[str, Any]]:
+    """Return recent telemetry events registered during the current active session."""
+    return list(_TELEMETRY_EVENT_BUFFER)
+
+
 def is_ga4_configured() -> bool:
     """Check if GA4 credentials / IDs are set and non-placeholder."""
-    property_id = os.getenv("GA4_PROPERTY_ID") or os.getenv("GA4_MEASUREMENT_ID")
-    api_secret = os.getenv("GA4_API_SECRET")
-    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-
+    property_id = _get_config_value("GA4_PROPERTY_ID") or _get_config_value("GA4_MEASUREMENT_ID")
     if not property_id or "your_" in property_id.lower():
         return False
     return True
@@ -56,8 +133,8 @@ def fetch_ga4_30day_page_metrics(
     Gracefully handles missing credentials or zero data by returning an empty list
     or pilot benchmark data if configured.
     """
-    prop_id = property_id or os.getenv("GA4_PROPERTY_ID") or os.getenv("GA4_MEASUREMENT_ID")
-    creds = credentials_path or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    prop_id = property_id or _get_config_value("GA4_PROPERTY_ID") or _get_config_value("GA4_MEASUREMENT_ID")
+    creds = credentials_path or _get_config_value("GOOGLE_APPLICATION_CREDENTIALS")
 
     if not prop_id or "your_" in str(prop_id).lower():
         logger.info("GA4 Property ID unconfigured or placeholder.")
@@ -75,13 +152,24 @@ def fetch_ga4_30day_page_metrics(
             RunReportRequest,
         )
 
+        service_account_info = None
+        try:
+            import streamlit as st
+            if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
+                service_account_info = dict(st.secrets["gcp_service_account"])
+        except Exception:
+            pass
+
         if creds and os.path.exists(creds):
             client = BetaAnalyticsDataClient.from_service_account_json(creds)
+        elif service_account_info:
+            client = BetaAnalyticsDataClient.from_service_account_info(service_account_info)
         else:
             client = BetaAnalyticsDataClient()
 
+        clean_prop_id = str(prop_id).strip().replace("properties/", "")
         request = RunReportRequest(
-            property=f"properties/{prop_id}",
+            property=f"properties/{clean_prop_id}",
             dimensions=[Dimension(name="pagePath")],
             metrics=[
                 Metric(name="screenPageViews"),
